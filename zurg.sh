@@ -196,6 +196,7 @@ organize_paths_files(){
     log "[INFO] Organizing Paths Enumeration files..."
     move_file "$outdir/gau.txt" "$outdir/PATHS/"
     move_file "$outdir/goofuzz.txt" "$outdir/PATHS/"
+    move_file "$outdir/gospider.txt" "$outdir/PATHS/"
     move_file "$outdir/ffuf.txt" "$outdir/PATHS/"
     move_file "$outdir/katana.txt" "$outdir/PATHS/"
     move_file "$outdir/waybackpy.txt" "$outdir/PATHS/"
@@ -377,7 +378,8 @@ run_paths_enumeration(){
   # --- ГРУППА 2: АКТИВНЫЙ СБОР ---
   if [ "$rate_limit_block" = false ]; then
       log "[INFO] Rate Limit OK. Running Active Discovery..."
-      run_tool "katana" "katana -silent -u $domain -rl 15 -fs fqdn -jc -jsl" "$outdir/katana.txt"
+      run_tool "katana" "katana -silent -u \"https://$domain\" -rl 15 -fs fqdn -jc -jsl" "$outdir/katana.txt"
+      run_tool "gospider" "gospider -s \"https://$domain\" -d 0 --js -a --quiet --raw --robots --sitemap | grep -aEo 'https?://[^ ]+'" "$outdir/gospider.txt"
       if [ -f "$FFUF_WORDLIST" ]; then
           run_tool "ffuf" "ffuf -u https://$domain/FUZZ -w $FFUF_WORDLIST -t 40 -fc 404 -ic -noninteractive" "$outdir/ffuf.txt"
       fi
@@ -410,7 +412,7 @@ run_paths_enumeration(){
   pushd "$outdir/PATHS" > /dev/null
 
     # 1. Агрегация всех сырых данных
-    cat gau.txt katana.txt waybackpy.txt ffuf_clean.txt goofuzz.txt 2>/dev/null | sort -u > ALL_PATHS.txt
+    cat gau.txt katana.txt waybackpy.txt ffuf_clean.txt goofuzz.txt gospider.txt 2>/dev/null | sort -u > ALL_PATHS.txt
 
     if [ -s "ALL_PATHS.txt" ]; then
         # Регулярки для расширений (учитываем возможные параметры типа .js?v=1)
