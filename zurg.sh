@@ -262,21 +262,16 @@ check_rate_limit(){
 run_subdomains_enumeration(){
   log "[START] Start Subdomains Enumeration"
 
+  # 1. AORT MODULE (Fail-safe + Strict Scope)
+  log "[INFO] Запуск aort (Isolated Mode)..."
 
-    # 1. AORT MODULE (Fail-safe logic)
- log "[INFO] Запуск aort (Isolated Mode)..."
-
-  # Создаем временную песочницу внутри OUTDIR
   local aort_sandbox="$outdir/AORT_TEMP"
   mkdir -p "$aort_sandbox"
-
-  # Сохраняем путь и переходим в песочницу
   pushd "$aort_sandbox" > /dev/null
 
-  # Запускаем aort.
   _timeout_cmd "$TIMEOUT_SECONDS" aort -d "$domain" --quiet --whois --enum --wayback > "aort_exec.log" 2>&1 || true
 
-  # --- ОБРАБОТКА ПОДДОМЕНОВ (Subdomains) ---
+  # --- ОБРАБОТКА ПОДДОМЕНОВ ---
   if [ -f "aort_exec.log" ]; then
       log "[INFO] Извлечение поддоменов из лога aort..."
       grep -E '^\|' "aort_exec.log" | \
@@ -287,28 +282,25 @@ run_subdomains_enumeration(){
       sort -u >> "$outdir/aort.txt"
   fi
 
-  # --- ОБРАБОТКА ПУТЕЙ (Paths) ---
+  # --- ОБРАБОТКА ПУТЕЙ (STRICT FILTER) ---
   log "[INFO] Filtering and collecting Aort paths..."
-
-  # Создаем/очищаем целевой файл перед записью
   : > "$outdir/PATHS/aort_paths.txt"
 
-  # nullglob: если файлов нет, цикл не запустится
   shopt -s nullglob
   local aort_files=(*wayback.txt *json-endpoints.txt redirects.json)
 
   for f in "${aort_files[@]}"; do
       if [ -s "$f" ]; then
           log "[DEBUG] Processing Aort file: $f"
-          # Фильтруем: берем строку только если в ней есть наш домен
-          # -F (Fixed string) ускоряет поиск и убирает спецсимволы
-          # -a (text file) на случай, если aort запишет бинарный мусор
-          grep -aF "$domain" "$f" >> "$outdir/PATHS/aort_paths.txt" || true
+          # ИСПОЛЬЗУЕМ AWK ДЛЯ СТРОГОГО СРАВНЕНИЯ ХОСТА
+          # Разбиваем по '/' ($3 = хост:порт).
+          # Разбиваем $3 по ':' (чтобы убрать порт).
+          # Если хост строго равен $domain — печатаем.
+          awk -F/ -v d="$domain" '{ split($3, h, ":"); if (h[1] == d) print $0 }' "$f" >> "$outdir/PATHS/aort_paths.txt"
       fi
   done
   shopt -u nullglob
 
-  # Возвращаемся и удаляем временную папку
   popd > /dev/null
   rm -rf "$aort_sandbox"
 
@@ -318,7 +310,6 @@ run_subdomains_enumeration(){
   local harvester_final="$outdir/theHarvester.txt"
 
   if _timeout_cmd "$TIMEOUT_SECONDS" uv run --active --project "$HARVESTER_DIR" theHarvester -b all -q -d "$domain" > "$harvester_log" 2>&1; then
-      log "[INFO] Извлечение поддоменов из лога..."
       awk '/\[\*\] Hosts found:/,/^$/' "$harvester_log" | \
       grep -vE '\[\*\]|---|^\s*$' | \
       cut -d':' -f1 | \
@@ -335,9 +326,13 @@ run_subdomains_enumeration(){
   run_tool "chaos" "chaos -key $PROJECTDISCOVERY_API_KEY -silent -d $domain" "$outdir/chaos.txt"
   run_tool "puredns" "puredns bruteforce $PUREDNS_WORDLIST $domain" "$outdir/puredns.txt"
 
+  # [FIX] УДАЛЕНИЕ МУСОРА ОТ SUBFINDER
+  if [ -f "resume.cfg" ]; then rm -f "resume.cfg"; fi
+  if [ -f "$SCRIPT_DIR/resume.cfg" ]; then rm -f "$SCRIPT_DIR/resume.cfg"; fi
+
   organize_subdomains_files
 
-  # 4. Consolidation & Validation (httpx)
+  # 4. Consolidation & Validation
   log "[INFO] Consolidating and Validating Subdomains..."
   pushd "$outdir/SUBDOMAINS" > /dev/null
     cat * | sort -u >> ALL_SUBDOMAINS.txt
