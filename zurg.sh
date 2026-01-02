@@ -262,7 +262,57 @@ check_rate_limit(){
 run_subdomains_enumeration(){
   log "[START] Start Subdomains Enumeration"
 
-  # 1. THE HARVESTER MODULE
+
+    # 1. AORT MODULE (Fail-safe logic)
+ log "[INFO] Запуск aort (Isolated Mode)..."
+
+  # Создаем временную песочницу внутри OUTDIR
+  local aort_sandbox="$outdir/AORT_TEMP"
+  mkdir -p "$aort_sandbox"
+
+  # Сохраняем путь и переходим в песочницу
+  pushd "$aort_sandbox" > /dev/null
+
+  # Запускаем aort.
+  _timeout_cmd "$TIMEOUT_SECONDS" aort -d "$domain" --quiet --whois --enum --wayback > "aort_exec.log" 2>&1 || true
+
+  # --- ОБРАБОТКА ПОДДОМЕНОВ (Subdomains) ---
+  if [ -f "aort_exec.log" ]; then
+      log "[INFO] Извлечение поддоменов из лога aort..."
+      grep -E '^\|' "aort_exec.log" | \
+      sed 's/|//g' | \
+      awk '{$1=$1};1' | \
+      sed -E 's/^\*\.//; s/^\s*//' | \
+      awk '{print $1}' | \
+      sort -u >> "$outdir/aort.txt"
+  fi
+
+  # --- ОБРАБОТКА ПУТЕЙ (Paths) ---
+  log "[INFO] Filtering and collecting Aort paths..."
+
+  # Создаем/очищаем целевой файл перед записью
+  : > "$outdir/PATHS/aort_paths.txt"
+
+  # nullglob: если файлов нет, цикл не запустится
+  shopt -s nullglob
+  local aort_files=(*wayback.txt *json-endpoints.txt redirects.json)
+
+  for f in "${aort_files[@]}"; do
+      if [ -s "$f" ]; then
+          log "[DEBUG] Processing Aort file: $f"
+          # Фильтруем: берем строку только если в ней есть наш домен
+          # -F (Fixed string) ускоряет поиск и убирает спецсимволы
+          # -a (text file) на случай, если aort запишет бинарный мусор
+          grep -aF "$domain" "$f" >> "$outdir/PATHS/aort_paths.txt" || true
+      fi
+  done
+  shopt -u nullglob
+
+  # Возвращаемся и удаляем временную папку
+  popd > /dev/null
+  rm -rf "$aort_sandbox"
+
+  # 2. THE HARVESTER MODULE
   log "[INFO] Запуск theHarvester (Log-Extraction Mode)..."
   local harvester_log="$outdir/LOGS/theHarvester_exec.log"
   local harvester_final="$outdir/theHarvester.txt"
@@ -275,62 +325,6 @@ run_subdomains_enumeration(){
       sed -E 's/^\*\.//; s/^\.//' | \
       grep -E '^([a-zA-Z0-9](([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z0-9]{2,})$' | \
       sort -u >> "$harvester_final"
-  fi
-
-  # 2. AORT MODULE (Fail-safe logic)
-  log "[INFO] Запуск aort (Log-Extraction Mode - Fail-safe)..."
-  local aort_log="$outdir/LOGS/aort_log.txt"
-  local aort_final="$outdir/aort.txt"
-
-  _timeout_cmd "$TIMEOUT_SECONDS" aort -d "$domain" --quiet --whois --enum --wayback > "$aort_log" 2>&1 || true
-
-  if [ -f "$aort_log" ]; then
-      log "[INFO] Извлечение поддоменов из лога aort..."
-      grep -E '^\|' "$aort_log" | \
-      sed 's/|//g' | \
-      awk '{$1=$1};1' | \
-      sed -E 's/^\*\.//; s/^\s*//' | \
-      awk '{print $1}' | \
-      sort -u >> "$aort_final"
-
-      if [ -s "$aort_final" ]; then
-          log "[OK] Aort parsed successfully: $(wc -l < "$aort_final") subdomains found."
-      fi
-  fi
-
-  log "[INFO] Запуск GooFuzz (Subdomains Dorking Mode)..."
-  local goofuzz_subs_log="$outdir/LOGS/goofuzz_subs_log.txt"
-  local goofuzz_subs_final="$outdir/SUBDOMAINS/goofuzz.txt"
-
-   if [ -f "$GOOFUZZ_KEYS_PATH" ]; then
-      # Извлекаем директорию и имя файла ключей
-      local keys_dir=$(dirname "$GOOFUZZ_KEYS_PATH")
-      local keys_file=$(basename "$GOOFUZZ_KEYS_PATH")
-
-      # Запуск через Docker. Используем -i без -t для стабильности в скриптах.
-      # Монтируем директорию с ключами в /mnt контейнера.
-      # Флаги: -p 10 (pages), -s (subdomains)
-      _timeout_cmd "$TIMEOUT_SECONDS" docker run --rm \
-          -v "${keys_dir}:/mnt:ro" \
-          goofuzz -t "$domain" -k "/mnt/${keys_file}" \
-          -p 10 -s > "$goofuzz_subs_log" 2>&1 || true
-
-      if [ -f "$goofuzz_subs_log" ]; then
-          # Проверяем, есть ли в логе фраза об отсутствии результатов
-          if grep -q "Sorry, no subdomains found for" "$goofuzz_subs_log"; then
-              log "[INFO] GooFuzz: No subdomains found via Dorks."
-          else
-              log "[INFO] Извлечение поддоменов из GooFuzz..."
-              # Парсим строки, оканчивающиеся на целевой домен (например, sub.domain.com)
-              grep -E "\.$domain$" "$goofuzz_subs_log" | sort -u >> "$goofuzz_subs_final"
-
-              if [ -s "$goofuzz_subs_final" ]; then
-                  log "[OK] GooFuzz found $(wc -l < "$goofuzz_subs_final") subdomains."
-              fi
-          fi
-      fi
-  else
-      log "[WARN] GooFuzz skipped: Keys file not found at $GOOFUZZ_KEYS_PATH"
   fi
 
   # 3. Остальные инструменты
@@ -412,29 +406,35 @@ run_paths_enumeration(){
   pushd "$outdir/PATHS" > /dev/null
 
     # 1. Агрегация всех сырых данных
-    cat gau.txt katana.txt waybackpy.txt ffuf_clean.txt goofuzz.txt gospider.txt 2>/dev/null | sort -u > ALL_PATHS.txt
+    cat gau.txt katana.txt aort_paths.txt waybackpy.txt ffuf_clean.txt goofuzz.txt gospider.txt 2>/dev/null | sort -u > ALL_PATHS.txt
 
     if [ -s "ALL_PATHS.txt" ]; then
         # Регулярки для расширений (учитываем возможные параметры типа .js?v=1)
         local static_exts="jpg|jpeg|png|css|woff|woff2|svg|jsf"
         local js_exts="js"
+        local json_exts="json"
 
         # 2. Выделяем JavaScript (включая .js?t=123)
         log "[INFO] Extracting JavaScript files..."
         grep -Ei "\.(${js_exts})(\?.*)?$" ALL_PATHS.txt > ALL_JS.txt || true
         sed -ri "/\.(${js_exts})(\?.*)?$/Id" ALL_PATHS.txt
 
-        # 3. Выделяем Статику (включая .jpg?v=1)
+        # 3. Выделяем JavaScript (включая .json?v=123)
+        log "[INFO] Extracting JavaScript files..."
+        grep -Ei "\.(${json_exts})(\?.*)?$" ALL_PATHS.txt > ALL_JSON.txt || true
+        sed -ri "/\.(${json_exts})(\?.*)?$/Id" ALL_PATHS.txt
+
+        # 4. Выделяем Статику (включая .jpg?v=1)
         log "[INFO] Extracting static assets..."
         grep -Ei "\.(${static_exts})(\?.*)?$" ALL_PATHS.txt > ALL_STATIC.txt || true
         sed -ri "/\.(${static_exts})(\?.*)?$/Id" ALL_PATHS.txt
 
-        # 4. Выделяем Параметры (всё, где остался '?', но уже без JS и статики)
+        # 5. Выделяем Параметры (всё, где остался '?', но уже без JS и статики)
         log "[INFO] Extracting endpoints with parameters..."
         grep -F "?" ALL_PATHS.txt > ALL_PARAMS.txt || true
         sed -i "/\?/d" ALL_PATHS.txt
 
-        # 5. Финальная уникализация всех файлов
+        # 6. Финальная уникализация всех файлов
         for f in ALL_JS.txt ALL_STATIC.txt ALL_PARAMS.txt ALL_PATHS.txt; do
             if [ -f "$f" ]; then
                 sort -u "$f" -o "$f"
