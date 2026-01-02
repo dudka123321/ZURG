@@ -188,6 +188,7 @@ organize_subdomains_files(){
     move_file "$outdir/findomain.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/alterx.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/chaos.txt" "$outdir/SUBDOMAINS/"
+    move_file "$outdir/goofuzz_subs.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/puredns.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/aort.txt" "$outdir/SUBDOMAINS/"
 }
@@ -262,7 +263,40 @@ check_rate_limit(){
 run_subdomains_enumeration(){
   log "[START] Start Subdomains Enumeration"
 
-  # 1. AORT MODULE (Fail-safe + Strict Scope)
+
+# 1. GOOFUZZ SUBDOMAINS MODULE (INTEGRATED)
+  log "[INFO] Запуск GooFuzz (Subdomain Mode)..."
+
+  if [ -f "$GOOFUZZ_KEYS_PATH" ]; then
+      local keys_dir=$(dirname "$GOOFUZZ_KEYS_PATH")
+      local keys_file=$(basename "$GOOFUZZ_KEYS_PATH")
+      local gf_sub_log="$outdir/LOGS/goofuzz_subdomains.log"
+      local gf_sub_out="$outdir/goofuzz_subs.txt"
+
+      # Запускаем с флагом -s и -p 10. || true нужен, чтобы не крашилось если ничего не найдет.
+      _timeout_cmd "$TIMEOUT_SECONDS" docker run --rm \
+          -v "${keys_dir}:/mnt:ro" \
+          goofuzz -t "$domain" -k "/mnt/${keys_file}" \
+          -s -p 10 > "$gf_sub_log" 2>&1 || true
+
+      if [ -s "$gf_sub_log" ]; then
+          log "[INFO] Parsing GooFuzz subdomain results..."
+          # 1. Убираем строку "Sorry..." и строку "Target:"
+          # 2. Ищем строки с нашим доменом (гарантия релевантности)
+          # 3. Чистим от *. в начале
+          # 4. Добавляем https:// в начало строки
+          grep -vE "Sorry, no subdomains found|^Target:" "$gf_sub_log" | \
+          grep -F "$domain" | \
+          sed -E 's/^\*\.//' | \
+          sed 's/^/https:\/\//' | \
+          sort -u >> "$gf_sub_out"
+      fi
+  else
+      log "[WARN] GooFuzz keys not found. Skipping."
+  fi
+
+
+  # 2. AORT MODULE (Fail-safe + Strict Scope)
   log "[INFO] Запуск aort (Isolated Mode)..."
 
   local aort_sandbox="$outdir/AORT_TEMP"
@@ -304,7 +338,7 @@ run_subdomains_enumeration(){
   popd > /dev/null
   rm -rf "$aort_sandbox"
 
-  # 2. THE HARVESTER MODULE
+  # 3. THE HARVESTER MODULE
   log "[INFO] Запуск theHarvester (Log-Extraction Mode)..."
   local harvester_log="$outdir/LOGS/theHarvester_exec.log"
   local harvester_final="$outdir/theHarvester.txt"
@@ -318,7 +352,7 @@ run_subdomains_enumeration(){
       sort -u >> "$harvester_final"
   fi
 
-  # 3. Остальные инструменты
+  # 4. Остальные инструменты
   run_tool "subfinder" "subfinder -d $domain -silent" "$outdir/subfinder.txt"
   run_tool "assetfinder" "assetfinder --subs-only $domain" "$outdir/assetfinder.txt"
   run_tool "findomain" "findomain -q -t $domain" "$outdir/findomain.txt"
@@ -355,9 +389,9 @@ run_paths_enumeration(){
       _timeout_cmd "$TIMEOUT_SECONDS" docker run --rm \
           -v "${keys_dir}:/mnt:ro" \
           goofuzz -t "$domain" -k "/mnt/${keys_file}" \
-          -e php,bak,old,sql,conf,env,log -p 10 > "$outdir/LOGS/goofuzz_log.txt" 2>&1 || true
-      if [ -f "$outdir/LOGS/goofuzz_log.txt" ]; then
-          grep -E '^https?://' "$outdir/LOGS/goofuzz_log.txt" | sort -u >> "$outdir/goofuzz.txt"
+          -e php,bak,old,sql,conf,env,log -p 10 > "$outdir/LOGS/goofuzz_log_paths.txt" 2>&1 || true
+      if [ -f "$outdir/LOGS/goofuzz_log_paths.txt" ]; then
+          grep -E '^https?://' "$outdir/LOGS/goofuzz_log_paths.txt" | sort -u >> "$outdir/goofuzz.txt"
       fi
   fi
 
