@@ -256,6 +256,59 @@ check_rate_limit(){
     fi
 }
 
+smart_deduplicate_paths(){
+    local input_file="$1"
+    local keep_file="$2"
+    local trash_file="$3"
+
+    if [ ! -s "$input_file" ]; then return; fi
+
+    log "[INFO] Running Smart Deduplication (Pattern Filtering)..."
+
+    # Создаем временные файлы
+    local temp_keep="${input_file}.keep.tmp"
+    local temp_trash="${input_file}.trash.tmp"
+
+    awk '{
+        original = $0;
+        signature = $0;
+
+        # 1. Замена UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) на {UUID}
+        gsub(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/, "{UUID}", signature);
+
+        # 2. Замена целых чисел (ID) в путях
+        # Меняем /123/ или /123 в конце строки на /{INT}/
+        gsub(/\/[0-9]+(\/|$|\?)/, "/{INT}/", signature);
+
+        # 3. Замена числовых параметров (id=123)
+        gsub(/=[0-9]+(&|$)/, "={INT}&", signature);
+
+        # ЛОГИКА:
+        # seen[signature]++ вернет 0, если видим паттерн первый раз -> печатаем в temp_keep
+        # Если > 0, значит паттерн уже был -> печатаем в temp_trash
+        if (!seen[signature]++) {
+            print original > "'"$temp_keep"'"
+        } else {
+            print original > "'"$temp_trash"'"
+        }
+    }' "$input_file"
+
+    # Перезаписываем основной файл очищенными данными
+    if [ -f "$temp_keep" ]; then
+        mv "$temp_keep" "$keep_file"
+        local count_keep=$(wc -l < "$keep_file")
+        log "[OK] Optimized paths kept: $count_keep"
+    fi
+
+    # Сохраняем мусор в логи
+    if [ -f "$temp_trash" ]; then
+        cat "$temp_trash" >> "$trash_file"
+        rm "$temp_trash"
+        local count_trash=$(wc -l < "$trash_file")
+        log "[INFO] Redundant dynamic URLs moved to logs: $count_trash"
+    fi
+}
+
 # ====================================================================
 # MODULES
 # ====================================================================
@@ -439,16 +492,17 @@ run_paths_enumeration(){
 
     if [ -s "ALL_PATHS.txt" ]; then
         # Регулярки для расширений (учитываем возможные параметры типа .js?v=1)
-        local static_exts="jpg|jpeg|png|css|woff|woff2|svg|jsf"
+        local static_exts="jpg|jpeg|png|css|woff|woff2|svg|jsf|"
         local js_exts="js"
         local json_exts="json"
+        local static_files_exts="pdf|xls|xlst|xml|php|jar|old|sql|bak|conf|env|log|"
 
         # 2. Выделяем JavaScript (включая .js?t=123)
         log "[INFO] Extracting JavaScript files..."
         grep -Ei "\.(${js_exts})(\?.*)?$" ALL_PATHS.txt > ALL_JS.txt || true
         sed -ri "/\.(${js_exts})(\?.*)?$/Id" ALL_PATHS.txt
 
-        # 3. Выделяем JavaScript (включая .json?v=123)
+        # 3. Выделяем JSON (включая .json?v=123)
         log "[INFO] Extracting JavaScript files..."
         grep -Ei "\.(${json_exts})(\?.*)?$" ALL_PATHS.txt > ALL_JSON.txt || true
         sed -ri "/\.(${json_exts})(\?.*)?$/Id" ALL_PATHS.txt
@@ -458,18 +512,33 @@ run_paths_enumeration(){
         grep -Ei "\.(${static_exts})(\?.*)?$" ALL_PATHS.txt > ALL_STATIC.txt || true
         sed -ri "/\.(${static_exts})(\?.*)?$/Id" ALL_PATHS.txt
 
-        # 5. Выделяем Параметры (всё, где остался '?', но уже без JS и статики)
+        # 5. Выделяем INTERESTING STATIC FILES
+        log "[INFO] Extracting Interesting static files..."
+        grep -Ei "\.(${static_files_exts})(\?.*)?$" ALL_PATHS.txt > ALL_STRANGE_EXT_FILES.txt || true
+        sed -ri "/\.(${static_files_exts})(\?.*)?$/Id" ALL_PATHS.txt
+
+        # 6. Выделяем Параметры (всё, где остался '?', но уже без JS и статики)
         log "[INFO] Extracting endpoints with parameters..."
         grep -F "?" ALL_PATHS.txt > ALL_PARAMS.txt || true
         sed -i "/\?/d" ALL_PATHS.txt
 
-        # 6. Финальная уникализация всех файлов
-        for f in ALL_JS.txt ALL_STATIC.txt ALL_PARAMS.txt ALL_PATHS.txt; do
+
+        # 7. Финальная уникализация всех файлов
+        for f in ALL_JS.txt ALL_STATIC.txt ALL_PARAMS.txt; do
             if [ -f "$f" ]; then
                 sort -u "$f" -o "$f"
                 log "[DEBUG] Created $f ($(wc -l < "$f") lines)"
             fi
         done
+
+        # 8. Умная очистка ALL_PATHS.txt (Оставляем 1 представителя, дубли в LOGS)
+        if [ -s "ALL_PATHS.txt" ]; then
+            sort -u "ALL_PATHS.txt" -o "ALL_PATHS.txt"
+
+            smart_deduplicate_paths "ALL_PATHS.txt" "ALL_PATHS.txt" "../LOGS/DINAMIC_URLS.txt"
+        else
+             log "[WARN] ALL_PATHS.txt is empty. Sorting skipped."
+        fi
     else
         log "[WARN] ALL_PATHS.txt is empty. Sorting skipped."
     fi
