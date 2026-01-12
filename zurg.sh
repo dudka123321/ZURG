@@ -189,6 +189,7 @@ organize_subdomains_files(){
     move_file "$outdir/alterx.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/chaos.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/goofuzz_subs.txt" "$outdir/SUBDOMAINS/"
+    move_file "$outdir/bbot.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/puredns.txt" "$outdir/SUBDOMAINS/"
     move_file "$outdir/aort.txt" "$outdir/SUBDOMAINS/"
 }
@@ -317,7 +318,58 @@ run_subdomains_enumeration(){
   log "[START] Start Subdomains Enumeration"
 
 
-# 1. GOOFUZZ SUBDOMAINS MODULE (INTEGRATED)
+
+# 1. BBOT SUBS ENUMERATION
+run_bbot(){
+    log "[INFO] Запуск BBOT (Subdomain Enum)..."
+
+    local bbot_log="$outdir/LOGS/bbot_exec.log"
+    local bbot_out="$outdir/bbot.txt"
+
+    # РЕШЕНИЕ ПРОБЛЕМЫ 1 (Интерактивность):
+    # -y       : Автоматически отвечает "Yes" на все вопросы (skip confirmation).
+    # --force  : Продолжает сканирование, даже если часть модулей упала (soft-fail).
+    # --silent : Убирает ASCII-баннеры, но оставляет логи событий (хотя мы все равно грепаем всё).
+
+    # Запускаем bbot, перенаправляя весь stdout и stderr в лог
+    if _timeout_cmd "$TIMEOUT_SECONDS" bbot -t "$domain" -p subdomain-enum -y --force > "$bbot_log" 2>&1; then
+        log "[OK] BBOT scan finished."
+    else
+        log "[WARN] BBOT process failed or timed out."
+    fi
+
+    # РЕШЕНИЕ ПРОБЛЕМЫ 2 (Парсинг грязного вывода):
+    if [ -f "$bbot_log" ]; then
+        log "[INFO] Parsing BBOT raw output..."
+
+        # Экранируем точки в домене для точного regex (example.com -> example\.com)
+        local esc_domain="${domain//./\\.}"
+
+        cat "$bbot_log" | \
+        # 1. Удаляем ANSI-цвета (управляющие последовательности терминала)
+        sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" | \
+        # 2. Оставляем только строки, содержащие наш домен (оптимизация)
+        grep -F "$domain" | \
+        # 3. Убираем схемы (http://, https://, ftp://)
+        sed -E 's#^[a-zA-Z]+://##' | \
+        # 4. Убираем всё, что идет после первого слэша (пути /admin, /js/main.js)
+        sed 's#/.*##' | \
+        # 5. Убираем порты (:80, :443)
+        sed 's/:[0-9]*$//' | \
+        # 6. Финальный экстрактор: ищем строго валидные поддомены
+        #    grep -oE выведет только совпадение, отсекая мусор слева/справа (типа [DNS_NAME])
+        grep -oE "([a-zA-Z0-9._-]+\.)?${esc_domain}" | \
+        # 7. Сортировка и уникальность
+        sort -u >> "$bbot_out"
+
+        if [ -s "$bbot_out" ]; then
+            log "[OK] BBOT found subdomains: $(wc -l < "$bbot_out")"
+        fi
+    fi
+}
+run_bbot
+
+# 2. GOOFUZZ SUBDOMAINS MODULE (INTEGRATED)
   log "[INFO] Запуск GooFuzz (Subdomain Mode)..."
 
   if [ -f "$GOOFUZZ_KEYS_PATH" ]; then
@@ -349,7 +401,7 @@ run_subdomains_enumeration(){
   fi
 
 
-  # 2. AORT MODULE (Fail-safe + Strict Scope)
+  # 3. AORT MODULE (Fail-safe + Strict Scope)
   log "[INFO] Запуск aort (Isolated Mode)..."
 
   local aort_sandbox="$outdir/AORT_TEMP"
@@ -391,7 +443,7 @@ run_subdomains_enumeration(){
   popd > /dev/null
   rm -rf "$aort_sandbox"
 
-  # 3. THE HARVESTER MODULE
+  # 4. THE HARVESTER MODULE
   log "[INFO] Запуск theHarvester (Log-Extraction Mode)..."
   local harvester_log="$outdir/LOGS/theHarvester_exec.log"
   local harvester_final="$outdir/theHarvester.txt"
@@ -405,7 +457,7 @@ run_subdomains_enumeration(){
       sort -u >> "$harvester_final"
   fi
 
-  # 4. Остальные инструменты
+  # 5. Остальные инструменты
   run_tool "subfinder" "subfinder -d $domain -silent" "$outdir/subfinder.txt"
   run_tool "assetfinder" "assetfinder --subs-only $domain" "$outdir/assetfinder.txt"
   run_tool "findomain" "findomain -q -t $domain" "$outdir/findomain.txt"
@@ -419,7 +471,7 @@ run_subdomains_enumeration(){
 
   organize_subdomains_files
 
-  # 4. Consolidation & Validation
+  # 6. Consolidation & Validation
   log "[INFO] Consolidating and Validating Subdomains..."
   pushd "$outdir/SUBDOMAINS" > /dev/null
     cat * | sort -u >> ALL_SUBDOMAINS.txt
